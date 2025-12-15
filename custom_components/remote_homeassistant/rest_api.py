@@ -1,5 +1,6 @@
 """Simple implementation to call Home Assistant REST API."""
 
+import async_timeout
 from homeassistant import exceptions
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
@@ -44,7 +45,8 @@ async def async_get_discovery_info(hass, host, port, secure, access_token, verif
     session = async_get_clientsession(hass, verify_ssl)
 
     # Fetch discovery info location for name and unique UUID
-    async with session.get(url, headers=headers) as resp:
+    async with async_timeout.timeout(10):
+        resp = await session.get(url, headers=headers)
         if resp.status == 404:
             raise EndpointMissing()
         if 400 <= resp.status < 500:

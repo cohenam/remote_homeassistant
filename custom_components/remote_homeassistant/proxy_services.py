@@ -1,11 +1,14 @@
 """Support for proxy services."""
 from __future__ import annotations
 import asyncio
+import logging
 from typing import Any
 
 import voluptuous as vol
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.service import SERVICE_DESCRIPTION_CACHE
+
+_LOGGER = logging.getLogger(__name__)
 
 from .const import CONF_SERVICE_PREFIX, CONF_SERVICES, SERVICE_CALL_LIMIT
 
@@ -36,7 +39,7 @@ class ProxyServices:
 
     async def unload(self):
         """Call to unregister all registered services."""
-        description_cache = self.hass.data[SERVICE_DESCRIPTION_CACHE]
+        description_cache = self.hass.data.get(SERVICE_DESCRIPTION_CACHE, {})
 
         for domain, service_name in self.registered_services:
             self.hass.services.async_remove(domain, service_name)
@@ -55,18 +58,24 @@ class ProxyServices:
         if not service_prefix:
             return
 
-        description_cache = self.hass.data[SERVICE_DESCRIPTION_CACHE]
+        description_cache = self.hass.data.get(SERVICE_DESCRIPTION_CACHE)
+        if description_cache is None:
+            _LOGGER.warning("SERVICE_DESCRIPTION_CACHE not available, service descriptions won't be shown")
         for service in self.entry.options.get(CONF_SERVICES, []):
             domain, service_name = service.split(".")
             service = service_prefix + service_name
 
             # Register new service with same name as original service but with prefix
-            self.hass.services.async_register(
-                domain,
-                service,
-                self._async_handle_service_call,
-                vol.Schema({}, extra=vol.ALLOW_EXTRA),
-            )
+            try:
+                self.hass.services.async_register(
+                    domain,
+                    service,
+                    self._async_handle_service_call,
+                    vol.Schema({}, extra=vol.ALLOW_EXTRA),
+                )
+            except Exception as err:
+                _LOGGER.warning("Failed to register service %s.%s: %s", domain, service, err)
+                continue
 
             # <HERE_BE_DRAGON>
             # Service metadata can only be provided via a services.yaml file for a
@@ -75,8 +84,11 @@ class ProxyServices:
             # the internal representation of the cache change, this sill break.
             # </HERE_BE_DRAGONS>
             service_info = self.remote_services.get(domain, {}).get(service_name)
-            if service_info:
-                description_cache[f"{domain}.{service}"] = service_info
+            if service_info and description_cache is not None:
+                try:
+                    description_cache[f"{domain}.{service}"] = service_info
+                except Exception as err:
+                    _LOGGER.debug("Could not cache service description: %s", err)
 
             self.registered_services.append((domain, service))
 
