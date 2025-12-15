@@ -1,0 +1,25 @@
+# Docker Compose for testing remote_homeassistant
+# Usage:
+#   docker compose -f docker-compose.test.yml run hassfest   # Run hassfest validation
+#   docker compose -f docker-compose.test.yml up ha          # Start Home Assistant with component loaded (http://localhost:8123)
+
+services:
+  # Hassfest validation - validates manifest.json and integration structure
+  hassfest:
+    image: ghcr.io/home-assistant/hassfest:latest
+    volumes:
+      - ./custom_components/remote_homeassistant:/github/workspace/remote_homeassistant:ro
+    environment:
+      - INPUT_PATH=/github/workspace/remote_homeassistant
+
+  # Full Home Assistant instance for manual testing
+  ha:
+    image: ghcr.io/home-assistant/home-assistant:stable
+    volumes:
+      - ./custom_components:/config/custom_components:ro
+      - ./test_config:/config
+    ports:
+      - "8123:8123"
+    environment:
+      - TZ=UTC
+    restart: unless-stopped

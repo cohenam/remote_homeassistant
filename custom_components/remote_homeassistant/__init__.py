@@ -140,6 +140,10 @@ CONFIG_SCHEMA = vol.Schema(
 HEARTBEAT_INTERVAL = 20
 HEARTBEAT_TIMEOUT = 5
 
+INITIAL_RETRY_DELAY = 5
+MAX_RETRY_DELAY = 60
+RETRY_BACKOFF_FACTOR = 2
+
 INTERNALLY_USED_EVENTS = [EVENT_STATE_CHANGED]
 
 
@@ -343,8 +347,10 @@ class RemoteConnection:
 
         self._connection : Optional[ClientWebSocketResponse] = None
         self._heartbeat_task = None
+        self._recv_task = None
         self._is_stopping = False
         self._entities = set()
+        self._registered_entities = set()  # Track entities already registered in HA registry
         self._all_entity_names = set()
         self._handlers = {}
         self._remove_listener = None
@@ -364,12 +370,19 @@ class RemoteConnection:
 
     def _prefixed_entity_friendly_name(self, entity_friendly_name):
         if (self._entity_friendly_name_prefix
-            and entity_friendly_name.startswith(self._entity_friendly_name_prefix)
-            == False):
-            entity_friendly_name = (self._entity_friendly_name_prefix + 
+            and not entity_friendly_name.startswith(self._entity_friendly_name_prefix)):
+            entity_friendly_name = (self._entity_friendly_name_prefix +
                                     entity_friendly_name)
             return entity_friendly_name
         return entity_friendly_name
+
+    def _remove_entity_prefix(self, entity_id):
+        """Remove entity prefix from entity_id."""
+        if not self._entity_prefix:
+            return entity_id
+        domain, object_id = split_entity_id(entity_id)
+        object_id = object_id.replace(self._entity_prefix.lower(), "", 1)
+        return domain + "." + object_id
 
     def _full_picture_url(self, url):
         if re.match(r"^https?://", url):
@@ -445,22 +458,27 @@ class RemoteConnection:
         session = async_get_clientsession(self._hass, self._verify_ssl)
         self.set_connection_state(STATE_CONNECTING)
 
+        retry_count = 0
         while True:
             info = await _async_instance_get_info()
 
             # Verify we are talking to correct instance
             if not _async_instance_id_match(info):
                 self.set_connection_state(STATE_RECONNECTING)
-                await asyncio.sleep(10)
+                delay = min(MAX_RETRY_DELAY, INITIAL_RETRY_DELAY * (RETRY_BACKOFF_FACTOR ** retry_count))
+                await asyncio.sleep(delay)
+                retry_count += 1
                 continue
 
             try:
                 _LOGGER.info("Connecting to %s", url)
                 self._connection = await session.ws_connect(url, max_msg_size = self._max_msg_size)
             except aiohttp.client_exceptions.ClientError:
-                _LOGGER.error("Could not connect to %s, retry in 10 seconds...", url)
+                delay = min(MAX_RETRY_DELAY, INITIAL_RETRY_DELAY * (RETRY_BACKOFF_FACTOR ** retry_count))
+                _LOGGER.error("Could not connect to %s, retry in %s seconds...", url, delay)
                 self.set_connection_state(STATE_RECONNECTING)
-                await asyncio.sleep(10)
+                await asyncio.sleep(delay)
+                retry_count += 1
             else:
                 _LOGGER.info("Connected to home-assistant websocket at %s", url)
                 break
@@ -477,7 +495,7 @@ class RemoteConnection:
             sw_version=info.get("ha_version"),
         )
 
-        asyncio.ensure_future(self._recv())
+        self._recv_task = self._hass.async_create_task(self._recv())
         self._heartbeat_task = self._hass.loop.create_task(self._heartbeat_loop())
 
     async def _heartbeat_loop(self):
@@ -492,15 +510,17 @@ class RemoteConnection:
                 _LOGGER.debug("Got pong: %s", message)
                 event.set()
 
-            await self.call(resp, "ping")
+            handler_id = await self.call(resp, "ping")
 
             try:
                 await asyncio.wait_for(event.wait(), HEARTBEAT_TIMEOUT)
             except asyncio.TimeoutError:
                 _LOGGER.warning("heartbeat failed")
+                if handler_id is not None:
+                    self._handlers.pop(handler_id, None)
 
                 # Schedule closing on event loop to avoid deadlock
-                asyncio.ensure_future(self._connection.close())
+                self._hass.async_create_task(self._connection.close())
                 break
 
     async def async_stop(self):
@@ -515,10 +535,10 @@ class RemoteConnection:
         self.__id += 1
         return _id
 
-    async def call(self, handler, message_type, **extra_args) -> None:
+    async def call(self, handler, message_type, **extra_args) -> int | None:
         if self._connection is None:
             _LOGGER.error("No remote websocket connection")
-            return
+            return None
 
         _id = self._next_id()
         self._handlers[_id] = handler
@@ -526,14 +546,22 @@ class RemoteConnection:
             await self._connection.send_json(
                 {"id": _id, "type": message_type, **extra_args}
             )
+            return _id
         except aiohttp.client_exceptions.ClientError as err:
             _LOGGER.error("remote websocket connection closed: %s", err)
             await self._disconnected()
+            return None
 
     async def _disconnected(self):
         # Remove all published entries
         for entity in self._entities:
             self._hass.states.async_remove(entity)
+        # Cancel _recv task
+        if self._recv_task is not None:
+            self._recv_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._recv_task
+            self._recv_task = None
         if self._heartbeat_task is not None:
             self._heartbeat_task.cancel()
             try:
@@ -548,8 +576,9 @@ class RemoteConnection:
         self._remove_listener = None
         self._entities = set()
         self._all_entity_names = set()
+        self._registered_entities = set()
         if not self._is_stopping:
-            asyncio.ensure_future(self.async_connect())
+            self._hass.async_create_task(self.async_connect())
 
     async def _recv(self):
         while self._connection is not None and not self._connection.closed:
@@ -611,7 +640,7 @@ class RemoteConnection:
                 return
 
             else:
-                handler = self._handlers.get(message["id"])
+                handler = self._handlers.pop(message["id"], None)
                 if handler is not None:
                     if inspect.iscoroutinefunction(handler):
                         await handler(message)
@@ -649,15 +678,10 @@ class RemoteConnection:
                 return
 
             if self._entity_prefix:
+                entity_ids = {self._remove_entity_prefix(entity_id) for entity_id in entity_ids}
 
-                def _remove_prefix(entity_id):
-                    domain, object_id = split_entity_id(entity_id)
-                    object_id = object_id.replace(self._entity_prefix.lower(), "", 1)
-                    return domain + "." + object_id
-
-                entity_ids = {_remove_prefix(entity_id) for entity_id in entity_ids}
-
-            event_data = copy.deepcopy(event_data)
+            event_data = event_data.copy()
+            event_data["service_data"] = event_data["service_data"].copy()
             event_data["service_data"]["entity_id"] = list(entity_ids)
 
             # Remove service_call_id parameter - websocket API
@@ -724,16 +748,18 @@ class RemoteConnection:
 
             entity_id = self._prefixed_entity_id(entity_id)
 
-            # Add local unique id
+            # Add local unique id and register entity only once
             domain, object_id = split_entity_id(entity_id)
             attr['unique_id'] = f"{self._entry.unique_id[:16]}_{entity_id}"
-            entity_registry = er.async_get(self._hass)
-            entity_registry.async_get_or_create(
-                domain=domain,
-                platform='remote_homeassistant',
-                unique_id=attr['unique_id'],
-                suggested_object_id=object_id,
-            )
+            if entity_id not in self._registered_entities:
+                entity_registry = er.async_get(self._hass)
+                entity_registry.async_get_or_create(
+                    domain=domain,
+                    platform='remote_homeassistant',
+                    unique_id=attr['unique_id'],
+                    suggested_object_id=object_id,
+                )
+                self._registered_entities.add(entity_id)
 
             # Add local customization data
             if DATA_CUSTOMIZE in self._hass.data:
@@ -798,6 +824,10 @@ class RemoteConnection:
                         attributes[attr] = self._full_picture_url(value)
 
                 state_changed(entity_id, state, attributes)
+
+        # Prevent duplicate listener registration
+        if self._remove_listener is not None:
+            self._remove_listener()
 
         self._remove_listener = self._hass.bus.async_listen(
             EVENT_CALL_SERVICE, forward_event

@@ -1,0 +1,14 @@
+# Minimal Home Assistant configuration for testing remote_homeassistant
+homeassistant:
+  name: Test Home
+  unit_system: metric
+  time_zone: UTC
+
+# Enable default config
+default_config:
+
+# Logger for debugging
+logger:
+  default: info
+  logs:
+    custom_components.remote_homeassistant: debug

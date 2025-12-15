@@ -21,7 +21,7 @@ class ConnectionStatusSensor(Entity):
         self._state = None
         self._entry = config_entry
 
-        proto = 'http' if config_entry.data.get(CONF_SECURE) else 'https'
+        proto = 'https' if config_entry.data.get(CONF_SECURE) else 'http'
         host = config_entry.data[CONF_HOST]
         port = config_entry.data[CONF_PORT]
         self._attr_name = f"Remote connection to {host}:{port}"
@@ -59,7 +59,7 @@ class ConnectionStatusSensor(Entity):
         def _update_handler(state):
             """Update entity state when status was updated."""
             self._state = state
-            self.schedule_update_ha_state()
+            self.async_write_ha_state()
 
         signal = f"remote_homeassistant_{self._entry.unique_id}"
         self.async_on_remove(
