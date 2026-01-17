@@ -7,7 +7,6 @@ https://home-assistant.io/components/remote_homeassistant/
 from __future__ import annotations
 import asyncio
 from typing import Optional
-import copy
 import fnmatch
 import inspect
 import logging
@@ -345,10 +344,17 @@ class RemoteConnection:
         self._heartbeat_task = None
         self._is_stopping = False
         self._entities = set()
+        # PERF: Maintain lowercase version of entities for O(1) case-insensitive lookups
+        self._entities_lower = set()
         self._all_entity_names = set()
         self._handlers = {}
         self._remove_listener = None
         self.proxy_services = ProxyServices(hass, config_entry, self)
+
+        # PERF: Cache entity registry reference to avoid repeated lookups
+        self._entity_registry = None
+        # PERF: Track registered unique_ids to skip redundant async_get_or_create calls
+        self._registered_unique_ids = set()
 
         self.set_connection_state(STATE_CONNECTING)
 
@@ -357,9 +363,8 @@ class RemoteConnection:
     def _prefixed_entity_id(self, entity_id):
         if self._entity_prefix:
             domain, object_id = split_entity_id(entity_id)
-            object_id = self._entity_prefix + object_id
-            entity_id = domain + "." + object_id
-            return entity_id
+            # PERF: Use f-string instead of string concatenation
+            return f"{domain}.{self._entity_prefix}{object_id}"
         return entity_id
 
     def _prefixed_entity_friendly_name(self, entity_friendly_name):
@@ -372,7 +377,8 @@ class RemoteConnection:
         return entity_friendly_name
 
     def _full_picture_url(self, url):
-        if re.match(r"^https?://", url):
+        # PERF: Use str.startswith() instead of re.match() to avoid regex compilation
+        if url.startswith(('http://', 'https://')):
             return url
 
         baseURL = "%s://%s:%s" % (
@@ -547,7 +553,10 @@ class RemoteConnection:
         self._heartbeat_task = None
         self._remove_listener = None
         self._entities = set()
+        self._entities_lower = set()
         self._all_entity_names = set()
+        # PERF: Clear registered unique_ids on disconnect to allow re-registration on reconnect
+        self._registered_unique_ids = set()
         if not self._is_stopping:
             asyncio.ensure_future(self.async_connect())
 
@@ -611,7 +620,9 @@ class RemoteConnection:
                 return
 
             else:
-                handler = self._handlers.get(message["id"])
+                # PERF: Use pop() instead of get() to remove handler after use
+                # This prevents memory leak from accumulating stale handlers
+                handler = self._handlers.pop(message["id"], None)
                 if handler is not None:
                     if inspect.iscoroutinefunction(handler):
                         await handler(message)
@@ -638,12 +649,14 @@ class RemoteConnection:
             if not entity_ids:
                 return
 
+            # PERF: Convert incoming entity_ids to lowercase for comparison
             if isinstance(entity_ids, str):
-                entity_ids = (entity_ids.lower(),)
+                entity_ids = {entity_ids.lower()}
+            else:
+                entity_ids = {eid.lower() for eid in entity_ids}
 
-            entities = {entity_id.lower() for entity_id in self._entities}
-
-            entity_ids = entities.intersection(entity_ids)
+            # PERF: Use pre-computed lowercase set instead of creating new one each time
+            entity_ids = self._entities_lower.intersection(entity_ids)
 
             if not entity_ids:
                 return
@@ -653,11 +666,14 @@ class RemoteConnection:
                 def _remove_prefix(entity_id):
                     domain, object_id = split_entity_id(entity_id)
                     object_id = object_id.replace(self._entity_prefix.lower(), "", 1)
-                    return domain + "." + object_id
+                    # PERF: Use f-string instead of string concatenation
+                    return f"{domain}.{object_id}"
 
                 entity_ids = {_remove_prefix(entity_id) for entity_id in entity_ids}
 
-            event_data = copy.deepcopy(event_data)
+            # PERF: Shallow copy instead of deep copy - only service_data.entity_id needs modification
+            event_data = event_data.copy()
+            event_data["service_data"] = event_data["service_data"].copy()
             event_data["service_data"]["entity_id"] = list(entity_ids)
 
             # Remove service_call_id parameter - websocket API
@@ -694,6 +710,13 @@ class RemoteConnection:
             ):
                 return
 
+            # PERF: Pre-convert state to float once instead of on every filter iteration
+            state_float = None
+            try:
+                state_float = float(state)
+            except (ValueError, TypeError):
+                pass
+
             for f in self._filter:
                 if f[CONF_ENTITY_ID] and not f[CONF_ENTITY_ID].match(entity_id):
                     continue
@@ -702,8 +725,9 @@ class RemoteConnection:
                         continue
                     if f[CONF_UNIT_OF_MEASUREMENT] != attr[CONF_UNIT_OF_MEASUREMENT]:
                         continue
-                try:
-                    if f[CONF_BELOW] and float(state) < f[CONF_BELOW]:
+                # Only check thresholds if state was successfully converted to float
+                if state_float is not None:
+                    if f[CONF_BELOW] and state_float < f[CONF_BELOW]:
                         _LOGGER.info(
                             "%s: ignoring state '%s', because below '%s'",
                             entity_id,
@@ -711,7 +735,7 @@ class RemoteConnection:
                             f[CONF_BELOW],
                         )
                         return
-                    if f[CONF_ABOVE] and float(state) > f[CONF_ABOVE]:
+                    if f[CONF_ABOVE] and state_float > f[CONF_ABOVE]:
                         _LOGGER.info(
                             "%s: ignoring state '%s', because above '%s'",
                             entity_id,
@@ -719,33 +743,39 @@ class RemoteConnection:
                             f[CONF_ABOVE],
                         )
                         return
-                except ValueError:
-                    pass
 
             entity_id = self._prefixed_entity_id(entity_id)
 
             # Add local unique id
             domain, object_id = split_entity_id(entity_id)
             attr['unique_id'] = f"{self._entry.unique_id[:16]}_{entity_id}"
-            entity_registry = er.async_get(self._hass)
-            entity_registry.async_get_or_create(
-                domain=domain,
-                platform='remote_homeassistant',
-                unique_id=attr['unique_id'],
-                suggested_object_id=object_id,
-            )
+
+            # PERF: Cache entity registry and skip redundant async_get_or_create calls
+            # for entities we've already registered this session
+            if attr['unique_id'] not in self._registered_unique_ids:
+                if self._entity_registry is None:
+                    self._entity_registry = er.async_get(self._hass)
+                self._entity_registry.async_get_or_create(
+                    domain=domain,
+                    platform='remote_homeassistant',
+                    unique_id=attr['unique_id'],
+                    suggested_object_id=object_id,
+                )
+                self._registered_unique_ids.add(attr['unique_id'])
 
             # Add local customization data
             if DATA_CUSTOMIZE in self._hass.data:
                 attr.update(self._hass.data[DATA_CUSTOMIZE].get(entity_id))
 
-            for attrId, value in attr.items():
-                if attrId == "friendly_name":
-                    attr[attrId] = self._prefixed_entity_friendly_name(value)
-                if attrId == "entity_picture":
-                    attr[attrId] = self._full_picture_url(value)
+            # PERF: Direct key access instead of iterating all attributes - O(1) vs O(n)
+            if "friendly_name" in attr:
+                attr["friendly_name"] = self._prefixed_entity_friendly_name(attr["friendly_name"])
+            if "entity_picture" in attr:
+                attr["entity_picture"] = self._full_picture_url(attr["entity_picture"])
 
             self._entities.add(entity_id)
+            # PERF: Keep lowercase version in sync for efficient service call matching
+            self._entities_lower.add(entity_id.lower())
             self._hass.states.async_set(entity_id, state, attr)
 
         def fire_event(message):
@@ -764,6 +794,8 @@ class RemoteConnection:
                     # entity was removed in the remote instance
                     with suppress(ValueError, AttributeError, KeyError):
                         self._entities.remove(entity_id)
+                    with suppress(ValueError, AttributeError, KeyError):
+                        self._entities_lower.remove(entity_id.lower())
                     with suppress(ValueError, AttributeError, KeyError):
                         self._all_entity_names.remove(entity_id)
                     self._hass.states.async_remove(entity_id)
@@ -791,11 +823,11 @@ class RemoteConnection:
                 entity_id = entity["entity_id"]
                 state = entity["state"]
                 attributes = entity["attributes"]
-                for attr, value in attributes.items():
-                    if attr == "friendly_name":
-                        attributes[attr] = self._prefixed_entity_friendly_name(value)
-                    if attr == "entity_picture":
-                        attributes[attr] = self._full_picture_url(value)
+                # PERF: Direct key access instead of iterating all attributes - O(1) vs O(n)
+                if "friendly_name" in attributes:
+                    attributes["friendly_name"] = self._prefixed_entity_friendly_name(attributes["friendly_name"])
+                if "entity_picture" in attributes:
+                    attributes["entity_picture"] = self._full_picture_url(attributes["entity_picture"])
 
                 state_changed(entity_id, state, attributes)
 
